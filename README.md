@@ -12,41 +12,42 @@ It runs as a Docker container that serves MCP over **streamable HTTP** at `http:
 
 | Tool | What it does |
 |---|---|
-| `splashtop_get_account_info` | The token's user and team (`/users/basic_info`) and the team id in use. Good for testing your token |
-| `splashtop_list_computers` | Computers (streamers) in the team, filterable by name and group |
-| `splashtop_fleet_overview` | Every computer summarised: online / offline counts, counts by OS and group, and computers not seen for N days |
-| `splashtop_get_computer_inventory` | Hardware and software inventory for up to 1000 computers |
-| `splashtop_list_users` | Team members with role and status |
-| `splashtop_list_groups` / `splashtop_list_group_members` | Groups and their members |
-| `splashtop_list_logs` | Session, file transfer, history and Endpoint Management (Windows updates, endpoint security, alerts) logs, with time and text filters |
-| `splashtop_list_api_endpoints` / `splashtop_get_api_doc` | Search and read Splashtop's own API reference (`docs.splashtop.com/llms.txt`), so the right path and parameters can be looked up live |
-| `splashtop_api_request` | Calls any Splashtop Open API endpoint directly (computer tags, notes, access permissions, service desk, …). `{team_id}` in the path is filled in. GET, and POST to log/inventory queries, are always allowed; other requests need writes enabled and `confirm=true` |
+| `splashtop_get_account_info` | The token's user, time zone and scopes (`/users/basic_info`), and the team id in use. Good for testing your token |
+| `splashtop_list_computers` | Computers (streamers), filterable by name, online status and group. With `ids`, returns detail fields such as OS, IPs, streamer version, last session, Windows/macOS updates and antivirus status |
+| `splashtop_fleet_overview` | Every computer summarised: online / offline counts, counts by OS, group and streamer version, and computers not seen for N days |
+| `splashtop_get_computer_inventory` | Hardware and software inventory (system, hardware, serial numbers, software) for up to 1000 computers |
+| `splashtop_list_users` | Team members by status and role, with details (2FA, last login, last session, license) for chosen ids |
+| `splashtop_list_groups` / `splashtop_list_group_members` | User and computer groups with counts, and the users or computers in a group |
+| `splashtop_list_logs` | Remote sessions (finished and active), team history (joins, failed logins), file transfers, chat transcripts, service desk operations, and Endpoint Management alerts, antivirus, 1-to-many actions and Windows updates |
+| `splashtop_get_session_details` | Files transferred, commands run, chat, voice calls and recordings within one session |
+| `splashtop_list_tags` | Computer tags (labels) |
+| `splashtop_list_vulnerabilities` | CVEs on managed computers with CVSS, CISA KEV flag, affected computer count and remediation status (Endpoint Management) |
+| `splashtop_list_api_endpoints` / `splashtop_get_api_doc` | Search and read Splashtop's own API reference (`docs.splashtop.com/llms.txt`) |
+| `splashtop_api_request` | Calls any Splashtop Open API endpoint directly (scheduled access, policies, OS patches, support sessions, …). `{team_id}` in the path is filled in. GET, and POST to log/inventory queries, are always allowed; other requests need writes enabled and `confirm=true` |
 
-List tools take `page` / `per_page` and a raw `params` dict that is passed through to the API.
-Responses are unwrapped from Splashtop's `{"result": ..., "data": ...}` envelope. An error envelope
-(for example a missing scope) is reported as an error.
+Responses are unwrapped from Splashtop's `{"result", "commands", "messages", "data"}` envelope, and an
+error envelope (for example `token_auth_fail` or a missing scope) is reported as an error. Log times are
+UTC (`YYYY-MM-DD HH:MM:SS` or ISO 8601); a log query defaults to the last 7 days and covers at most 90.
 
 **Writes** only work when `SPLASHTOP_ENABLE_WRITES=true`, and only through `splashtop_api_request`.
 They take two steps. A call without `confirm` returns a preview of the request. The request is
 sent only when you call again with `confirm=true`.
 
-### A note on endpoints
-
-Splashtop publishes its full reference at [docs.splashtop.com](https://docs.splashtop.com). The dedicated tools
-use the documented team-scoped paths under `/api/open/v1/teams/{team_id}/`: `computers`, `users`,
-`groups`, `groups/{id}/members`, `inventory` and `logs/<type>`. Some log types are queried with POST.
-`splashtop_list_logs` tries GET and falls back to POST on a 405. If a tool returns 404 on your plan or
-API version, `splashtop_list_api_endpoints` and `splashtop_get_api_doc` show what Splashtop documents,
-and `splashtop_api_request` can call it.
+The tools follow the [Splashtop Open API v2.1 reference](https://docs.splashtop.com). If a new endpoint is
+not covered, `splashtop_list_api_endpoints` and `splashtop_get_api_doc` find it and `splashtop_api_request`
+calls it.
 
 ## Splashtop API token
 
 1. Sign in to the Splashtop web console (my.splashtop.com, or my.splashtop.eu) as the **team owner** or a
    **super admin**. The Open API is part of Splashtop Enterprise / Remote Support Premium plans.
-2. Go to **Account Settings → Web API Tokens** and create a token. Give it the scopes you need: `users`,
+2. Go to **Account Settings → Web API Tokens** and create a token. **Use this kind of token only.** The
+   "API key for third-party integration" (used by ConnectWise, Autotask and other PSA/RMM tools to start
+   sessions) is a different credential. The Open API rejects it with `token_auth_fail` (result 41406). Give it the scopes you need: `users`,
    `logs`, `team_users`, `team_computers`, `team_groups`, `team_access_permission` and `inventory`.
    Mark it **read-only** unless you plan to enable writes.
-3. Put it in `SPLASHTOP_API_TOKEN`. EU-hosted teams also set `SPLASHTOP_API_URL=eu`.
+3. Put it in `SPLASHTOP_API_TOKEN`. EU-hosted teams also set `SPLASHTOP_API_URL=eu`, and OC-hosted
+   teams set `oc`.
 
 The team id (`stb_team_id`) is read from `/users/basic_info` on first use. Set `SPLASHTOP_TEAM_ID` to
 skip that lookup. The API allows about 200 calls per minute per endpoint, and a 429 is retried once.
@@ -56,7 +57,7 @@ skip that lookup. The API allows about 200 calls per minute per endpoint, and a 
 | Variable | Default | Description |
 |---|---|---|
 | `SPLASHTOP_API_TOKEN` | – | Splashtop Web API token (required) |
-| `SPLASHTOP_API_URL` | `us` | `us` (`https://webapi.splashtop.com`), `eu` (`https://webapi.splashtop.eu`) or a full URL |
+| `SPLASHTOP_API_URL` | `us` | `us` (`https://webapi.splashtop.com`), `eu` (`https://webapi.splashtop.eu`), `oc` (`https://webapi.splashtop.nr`) or a full URL |
 | `SPLASHTOP_TEAM_ID` | auto | Team id; detected from `/users/basic_info` when empty |
 | `MCP_AUTH_TOKEN` | – | **Strongly recommended.** Clients must send `Authorization: Bearer <token>` |
 | `SPLASHTOP_ENABLE_WRITES` | `false` | Allows modifying requests through `splashtop_api_request` |

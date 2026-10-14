@@ -11,7 +11,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from .client import MAX_PAGE, SplashtopClient, SplashtopError, extract_items, host_of, unwrap
+from .client import SplashtopClient, SplashtopError, extract_items, host_of, unwrap
 
 WRITES_ENABLED = os.getenv("SPLASHTOP_ENABLE_WRITES", "false").strip().lower() in ("1", "true", "yes")
 DOCS_URL = os.getenv("SPLASHTOP_DOCS_URL", "https://docs.splashtop.com").strip().rstrip("/")
@@ -29,9 +29,13 @@ of each computer.
 Tips:
 - Start with splashtop_get_account_info (verifies the token and shows the team).
 - "Which computers are offline / stale?" -> splashtop_fleet_overview.
-- Find a computer by name with splashtop_list_computers(name=...), then use its id for
-  splashtop_get_computer_inventory.
-- Who connected to what -> splashtop_list_logs(log_type="session").
+- Find a computer by name with splashtop_list_computers(name=...); pass its id in `ids` for OS,
+  IPs, version and antivirus details, or to splashtop_get_computer_inventory for hardware/software.
+- Who connected to what -> splashtop_list_logs(log_type="sessions"); then
+  splashtop_get_session_details for files, commands and chat inside a session.
+- Patch / security posture -> splashtop_list_logs("windows_updates" | "alerts" |
+  "endpoint_security") and splashtop_list_vulnerabilities.
+- Times are UTC. Log queries default to the last 7 days and span at most 90 days.
 - The API differs by plan and evolves. If a tool returns 404 or you need another endpoint, call
   splashtop_list_api_endpoints (Splashtop's own docs index), read the page with
   splashtop_get_api_doc, then call it with splashtop_api_request. Paths may contain {{team_id}}.
@@ -85,45 +89,24 @@ def _env(name: str) -> str | None:
 
 READ = ToolAnnotations(read_only_hint=True, open_world_hint=True)
 
-Page = Annotated[int | None, Field(ge=1, description="Page number (1-based); omit for the API default")]
-PerPage = Annotated[int | None, Field(ge=1, le=MAX_PAGE, description=f"Items per page (max {MAX_PAGE})")]
-Name = Annotated[str | None, Field(description="Case-insensitive 'contains' match on name, applied to the "
-                                               "returned items")]
+Name = Annotated[str | None, Field(description="Case-insensitive 'contains' match on name, host name or email, "
+                                               "applied to the returned items")]
 Params = Annotated[dict[str, Any] | None,
-                   Field(description="Extra raw query parameters passed to the Splashtop API "
+                   Field(description="Extra raw parameters passed to the Splashtop API "
                                      "(see splashtop_get_api_doc for what an endpoint accepts)")]
 
-NAME_KEYS = ("name", "computer_name", "hostname", "host_name", "device_name", "display_name",
-             "email", "user_name", "username", "group_name")
-ONLINE_KEYS = ("online", "is_online", "online_status", "status", "connection_status", "state")
-LAST_SEEN_KEYS = ("last_online", "last_online_time", "last_seen", "last_seen_at", "last_connected",
-                  "last_connection_time", "last_session_time", "last_login", "last_active",
-                  "last_activity", "updated_at")
-OS_KEYS = ("os", "os_name", "os_type", "os_version", "platform", "operating_system")
-TIME_KEYS = ("start_time", "started_at", "begin_time", "time", "timestamp", "created_at",
-             "date", "end_time", "log_time", "event_time")
-
-
-def _first(item: dict[str, Any], keys: tuple[str, ...]) -> tuple[str | None, Any]:
-    for key in keys:
-        if key in item and item[key] not in (None, ""):
-            return key, item[key]
-    return None, None
+NAME_KEYS = ("name", "host_name", "hostname", "computer_name", "srs_name", "src_name", "server_name",
+             "member_name", "email", "src_user_email", "splashtop_account", "display_name")
+TIME_KEYS = ("created_at", "start_time", "started_at", "time", "timestamp", "last_online")
+# Computer detail fields fetched for the fleet overview (Computer List, customized_fields).
+FLEET_FIELDS = "id,uuid,name,host_name,os,group_id,online_status,last_online,last_session,version,pubip,local_ip"
+DETAIL_BATCH = 5000
 
 
 def _matches(item: Any, needle: str) -> bool:
     if not isinstance(item, dict):
         return needle in str(item).lower()
     return any(needle in str(item.get(k) or "").lower() for k in NAME_KEYS)
-
-
-def _page_params(page: int | None, per_page: int | None, params: dict[str, Any] | None) -> dict[str, Any]:
-    out = dict(params or {})
-    if page is not None:
-        out["page"] = page
-    if per_page is not None:
-        out["per_page"] = per_page
-    return out
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -144,15 +127,25 @@ def _parse_time(value: Any) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def _st_time(value: str | None) -> str | None:
+    """Any ISO-ish timestamp -> Splashtop's ``YYYY-MM-DD HH:MM:SS`` (UTC)."""
+    if not value:
+        return None
+    dt = _parse_time(value)
+    if dt is None:
+        raise SplashtopError(f"Unrecognised time {value!r}; use YYYY-MM-DD HH:MM:SS (UTC) or ISO 8601")
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _is_online(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
         return value == 1
     text = str(value).strip().lower()
-    if text in ("online", "true", "1", "connected", "available", "busy", "in_session", "in session"):
+    if text in ("1", "online", "true", "connected", "busy"):
         return True
-    if text in ("offline", "false", "0", "disconnected", "unavailable"):
+    if text in ("0", "offline", "false", "disconnected"):
         return False
     return None
 
@@ -174,9 +167,15 @@ def _preview(action: str, target: Any, effect: str) -> dict[str, Any]:
     }
 
 
-async def _filtered_list(path: str, name: str | None, page: int | None, per_page: int | None,
-                         params: dict[str, Any] | None) -> dict[str, Any]:
-    result = await get_client().list(path, params=_page_params(page, per_page, params))
+def _csv(values: list[Any] | str | None) -> str | None:
+    if values is None or values == []:
+        return None
+    if isinstance(values, str):
+        return values
+    return ",".join(str(v) for v in values)
+
+
+def _filter_name(result: dict[str, Any], name: str | None) -> dict[str, Any]:
     if name:
         needle = name.lower()
         result["items"] = [i for i in result["items"] if _matches(i, needle)]
@@ -184,13 +183,32 @@ async def _filtered_list(path: str, name: str | None, page: int | None, per_page
     return result
 
 
+async def _computer_details(ids: list[Any], fields: str) -> list[dict[str, Any]]:
+    c = get_client()
+    out: list[dict[str, Any]] = []
+    for i in range(0, len(ids), DETAIL_BATCH):
+        chunk = ids[i:i + DETAIL_BATCH]
+        out.extend(x for x in extract_items(await c.get(
+            "/teams/{team_id}/computers", {"ids": _csv(chunk), "customized_fields": fields}))
+            if isinstance(x, dict))
+    return out
+
+
+async def _group_names() -> dict[str, str]:
+    try:
+        groups = extract_items(await get_client().get("/teams/{team_id}/groups"))
+    except SplashtopError:
+        return {}
+    return {str(g.get("id")): g.get("name") for g in groups if isinstance(g, dict)}
+
+
 # ======================================================================= read tools
 
 
 @mcp.tool(annotations=READ)
 async def splashtop_get_account_info() -> dict[str, Any]:
-    """Get the API token's user and team (basic_info), the team id in use and the API host. Good
-    first call to verify the token."""
+    """Get the API token's user, time zone and scopes (basic_info), the team id in use and the
+    API host. Good first call to verify the token."""
     c = get_client()
     info = unwrap(await c.basic_info())
     return {"api_url": c.base_url, "team_id": await c.team_id(), "writes_enabled": WRITES_ENABLED,
@@ -200,78 +218,100 @@ async def splashtop_get_account_info() -> dict[str, Any]:
 @mcp.tool(annotations=READ)
 async def splashtop_list_computers(
     name: Name = None,
-    group_id: Annotated[str | None, Field(description="Only computers in this group (sent as group_id)")] = None,
-    page: Page = None,
-    per_page: PerPage = None,
-    params: Params = None,
+    online: Annotated[bool | None, Field(description="true: online only, false: offline only")] = None,
+    group_id: Annotated[int | None, Field(description="Only computers in this group")] = None,
+    ids: Annotated[list[int] | None, Field(description="Computer ids to get details for (max 5000)")] = None,
+    fields: Annotated[list[str] | None, Field(
+        description="Detail fields when `ids` is given, e.g. id, uuid, name, host_name, os, group_id, "
+                    "online_status, last_online, last_session, version, pubip, local_ip, os_logon, os_user, "
+                    "os_domain, note, windows_updates, mac_updates, antivirus_software, antivirus_scan_status, "
+                    "unsolved_threats_count, antivirus_last_scan_time")] = None,
 ) -> dict[str, Any]:
-    """List the team's computers (streamers) with their id, name, group, OS, online status and
-    last-seen time. Needs the team_computers scope."""
-    extra = dict(params or {})
-    if group_id:
-        extra["group_id"] = group_id
-    return await _filtered_list("/teams/{team_id}/computers", name, page, per_page, extra)
+    """List the team's computers (streamers): id, name, uuid, host_name, online_status, last_online,
+    logged-on OS user. With `ids`, returns the chosen detail `fields` (OS, IPs, streamer version,
+    group, last session, Windows/macOS updates, antivirus status). Needs the team_computers scope."""
+    params: dict[str, Any] = {}
+    if online is not None:
+        params["online_status"] = 1 if online else 0
+    if group_id is not None:
+        params["group_id"] = group_id
+    if ids:
+        params["ids"] = _csv(ids)
+        params["customized_fields"] = _csv(fields) or FLEET_FIELDS
+    result = await get_client().list("/teams/{team_id}/computers", params=params)
+    return _filter_name(result, name)
 
 
 @mcp.tool(annotations=READ)
 async def splashtop_fleet_overview(
     offline_days: Annotated[float, Field(gt=0, description="Flag computers not seen for this many days")] = 30,
-    include_list: Annotated[bool, Field(description="Include the offline and stale computers")] = True,
+    include_list: Annotated[bool, Field(description="Include the stale and offline computers")] = True,
 ) -> dict[str, Any]:
-    """Summarise every computer in the team: how many are online and offline, counts by OS and
-    group, and which ones have not been seen for `offline_days`. Field names are detected from
-    the data; `detected_fields` shows which were used."""
-    computers = [c for c in await get_client().get_all("/teams/{team_id}/computers") if isinstance(c, dict)]
+    """Summarise every computer in the team: online / offline counts, counts by OS, group and
+    streamer version, and the computers not seen for `offline_days`."""
+    c = get_client()
+    overview = [x for x in extract_items(await c.get("/teams/{team_id}/computers")) if isinstance(x, dict)]
+    errors: dict[str, str] = {}
+    ids = [x["id"] for x in overview if x.get("id") is not None]
+    try:
+        details = {str(d.get("id")): d for d in await _computer_details(ids, FLEET_FIELDS)} if ids else {}
+    except SplashtopError as e:
+        details, errors["details"] = {}, str(e)
+    groups = await _group_names()
     now = datetime.now(timezone.utc)
-    stale_cutoff = now - timedelta(days=offline_days)
+    cutoff = now - timedelta(days=offline_days)
     online = offline = unknown = 0
     by_os: dict[str, int] = {}
     by_group: dict[str, int] = {}
+    by_version: dict[str, int] = {}
     stale: list[dict[str, Any]] = []
-    offline_list: list[dict[str, Any]] = []
-    detected: dict[str, str] = {}
-    for comp in computers:
-        status_key, status = _first(comp, ONLINE_KEYS)
-        seen_key, seen = _first(comp, LAST_SEEN_KEYS)
-        os_key, os_name = _first(comp, OS_KEYS)
-        for label, key in (("online", status_key), ("last_seen", seen_key), ("os", os_key)):
-            if key:
-                detected.setdefault(label, key)
-        state = _is_online(status) if status_key else None
+    offline_recent: list[dict[str, Any]] = []
+    for comp in overview:
+        comp = {**comp, **details.get(str(comp.get("id")), {})}
+        state = _is_online(comp.get("online_status"))
         if state is True:
             online += 1
         elif state is False:
             offline += 1
         else:
             unknown += 1
-        by_os[str(os_name or "Unknown")] = by_os.get(str(os_name or "Unknown"), 0) + 1
-        grp = comp.get("group")
-        group = comp.get("group_name") or (grp.get("name") if isinstance(grp, dict) else grp)
-        by_group[str(group or "Ungrouped")] = by_group.get(str(group or "Ungrouped"), 0) + 1
-        _, nm = _first(comp, NAME_KEYS)
-        summary = {"id": comp.get("id") or comp.get("computer_id") or comp.get("uuid"), "name": nm,
-                   "os": os_name, "group": group, "last_seen": seen}
-        last = _parse_time(seen)
-        if state is not True and last is not None and last < stale_cutoff:
+        os_name = str(comp.get("os") or "Unknown")
+        group = groups.get(str(comp.get("group_id"))) or (f"group {comp['group_id']}" if comp.get("group_id") else "Default")
+        version = str(comp.get("version") or "Unknown")
+        by_os[os_name] = by_os.get(os_name, 0) + 1
+        by_group[group] = by_group.get(group, 0) + 1
+        by_version[version] = by_version.get(version, 0) + 1
+        if state is True:
+            continue
+        summary = {"id": comp.get("id"), "name": comp.get("name"), "host_name": comp.get("host_name"),
+                   "os": comp.get("os"), "group": group, "last_online": comp.get("last_online")}
+        last = _parse_time(comp.get("last_online"))
+        if last is not None and last < cutoff:
             summary["days_since_seen"] = round((now - last).total_seconds() / 86400, 1)
             stale.append(summary)
         elif state is False:
-            offline_list.append(summary)
+            offline_recent.append(summary)
     stale.sort(key=lambda s: -s["days_since_seen"])
+
+    def ranked(d: dict[str, int]) -> dict[str, int]:
+        return dict(sorted(d.items(), key=lambda kv: -kv[1]))
+
     result: dict[str, Any] = {
         "checked_at": now.isoformat(),
-        "total": len(computers),
+        "total": len(overview),
         "online": online,
         "offline": offline,
         "status_unknown": unknown,
         f"not_seen_{offline_days:g}_days": len(stale),
-        "by_os": dict(sorted(by_os.items(), key=lambda kv: -kv[1])),
-        "by_group": dict(sorted(by_group.items(), key=lambda kv: -kv[1])),
-        "detected_fields": detected,
+        "by_os": ranked(by_os),
+        "by_group": ranked(by_group),
+        "by_streamer_version": ranked(by_version),
     }
     if include_list:
         result["stale"] = stale
-        result["offline_recently_seen"] = offline_list
+        result["offline_recently_seen"] = offline_recent
+    if errors:
+        result["errors"] = errors
     return result
 
 
@@ -279,99 +319,217 @@ async def splashtop_fleet_overview(
 async def splashtop_get_computer_inventory(
     computer_ids: Annotated[list[str], Field(min_length=1, max_length=1000,
                                              description="Computer ids from splashtop_list_computers")],
+    fields: Annotated[list[str], Field(
+        min_length=1,
+        description="system, hardware, software, or one serial number: hardware.serial_number, "
+                    "hardware.motherboard.serial_number, hardware.motherboard.bios_serial_number")
+    ] = ["system", "hardware", "software"],  # noqa: B006
 ) -> Any:
-    """Get hardware and software inventory (CPU, memory, disks, OS build, installed apps, ...)
-    for up to 1000 computers. Needs the inventory scope."""
-    c = get_client()
-    try:
-        return unwrap(await c.post("/teams/{team_id}/inventory", {"computer_ids": computer_ids}))
-    except SplashtopError as e:
-        if e.status_code not in (404, 405):
-            raise
-    # Older form: GET with the ids as a query parameter.
-    return unwrap(await c.get("/teams/{team_id}/inventory", {"computer_ids": computer_ids}))
+    """Get hardware and software inventory (OS, CPU, memory, disks, serial numbers, installed
+    software) for up to 1000 computers. Needs the inventory scope; limited to 10 calls a minute."""
+    return unwrap(await get_client().post("/teams/{team_id}/inventory",
+                                          {"ids": [str(i) for i in computer_ids], "fields": list(fields)}))
 
 
 @mcp.tool(annotations=READ)
 async def splashtop_list_users(
-    name: Annotated[str | None, Field(description="Case-insensitive match on name or email")] = None,
-    page: Page = None,
-    per_page: PerPage = None,
-    params: Params = None,
+    name: Name = None,
+    status: Annotated[Literal["enabled", "disabled", "invited", "declined", "quit"] | None,
+                      Field(description="Only users with this status")] = None,
+    roles: Annotated[list[Literal["owner", "manager", "member", "group_admin", "remote_user"]] | None,
+                     Field(description="Only these roles (manager = all admins incl. owner)")] = None,
+    ids: Annotated[list[int] | None, Field(description="User ids to get details for (max 5000)")] = None,
+    fields: Annotated[list[str] | None, Field(
+        description="Detail fields when `ids` is given: id, email, status, role, member_name, group_id, "
+                    "super_admin, group_scope, enable_2fa, access_permissions_kind, last_session_at, "
+                    "last_login_at, license_type, xauth_method_id, invite_code")] = None,
 ) -> dict[str, Any]:
-    """List team members (owner, admins, members) with role, status and email. Needs the
-    team_users scope."""
-    return await _filtered_list("/teams/{team_id}/users", name, page, per_page, params)
+    """List team members (id, email, status, role). With `ids`, returns detail `fields` such as
+    2FA, last login, last session, license type and group. Needs the team_users scope."""
+    params: dict[str, Any] = {"status": status, "roles": _csv(roles)}
+    if ids:
+        params["ids"] = _csv(ids)
+        params["customized_fields"] = _csv(fields) or (
+            "id,email,status,role,member_name,group_id,super_admin,enable_2fa,last_session_at,"
+            "last_login_at,license_type")
+    return _filter_name(await get_client().list("/teams/{team_id}/users", params=params), name)
 
 
 @mcp.tool(annotations=READ)
 async def splashtop_list_groups(
     name: Name = None,
-    page: Page = None,
-    per_page: PerPage = None,
-    params: Params = None,
+    group_type: Annotated[Literal["member", "computer"] | None,
+                          Field(description="member = user groups, computer = computer groups")] = None,
+    with_counts: Annotated[bool, Field(description="Include member, computer and admin counts")] = True,
 ) -> dict[str, Any]:
     """List the team's user and computer groups. Needs the team_groups scope."""
-    return await _filtered_list("/teams/{team_id}/groups", name, page, per_page, params)
+    params: dict[str, Any] = {"group_type": group_type}
+    if with_counts:
+        params.update(members_count=True, computers_count=True, admins_count=True)
+    return _filter_name(await get_client().list("/teams/{team_id}/groups", params=params), name)
 
 
 @mcp.tool(annotations=READ)
 async def splashtop_list_group_members(
-    group_id: Annotated[str, Field(description="Group id from splashtop_list_groups")],
-    page: Page = None,
-    per_page: PerPage = None,
-    params: Params = None,
+    group_id: Annotated[int, Field(description="Group id from splashtop_list_groups")],
+    kind: Annotated[Literal["users", "computers"], Field(description="Which members to list")] = "computers",
+    with_details: Annotated[bool, Field(description="Look up names for the returned ids")] = True,
 ) -> dict[str, Any]:
-    """List the members (users or computers) of a group."""
-    return await get_client().list(f"/teams/{{team_id}}/groups/{group_id}/members",
-                                   params=_page_params(page, per_page, params))
+    """List the users or computers in a group, with their names."""
+    c = get_client()
+    path = "members" if kind == "users" else "computers"
+    ids = [i for i in extract_items(await c.get(f"/teams/{{team_id}}/groups/{group_id}/{path}"))]
+    result: dict[str, Any] = {"group_id": group_id, "kind": kind, "count": len(ids), "ids": ids}
+    if with_details and ids and all(not isinstance(i, dict) for i in ids):
+        try:
+            if kind == "computers":
+                result["items"] = await _computer_details(
+                    ids, "id,name,host_name,os,online_status,last_online")
+            else:
+                result["items"] = extract_items(await c.get("/teams/{team_id}/users", {
+                    "ids": _csv(ids), "customized_fields": "id,email,member_name,role,status"}))
+        except SplashtopError as e:
+            result["details_error"] = str(e)
+    return result
+
+
+# Log endpoints (Splashtop Open API 5.7). "team": where the team id goes; "per_page": the
+# page-size parameter and its allowed range.
+LOGS: dict[str, dict[str, Any]] = {
+    "sessions": {"method": "POST", "path": "/teams/logs/closed_sessions", "team": "body",
+                 "per_page": ("per_page_size", 50, 500)},
+    "active_sessions": {"method": "POST", "path": "/teams/logs/active_sessions", "team": "body",
+                        "per_page": ("per_page_size", 50, 500)},
+    "history": {"method": "GET", "path": "/teams/logs/histories", "team": "query",
+                "per_page": ("per_page_size", 50, 500)},
+    "file_transfer": {"method": "GET", "path": "/teams/logs/file_transfer", "team": "query",
+                      "per_page": ("per_page_size", 50, 500)},
+    "chat_transcript": {"method": "GET", "path": "/teams/logs/chat_transcript", "team": "query",
+                        "per_page": ("per_page_size", 50, 500)},
+    "service_desk": {"method": "GET", "path": "/teams/logs/service_desks", "team": None,
+                     "per_page": ("per_page_size", 10, 100)},
+    "alerts": {"method": "GET", "path": "/teams/{team_id}/logs/alerts", "team": "path",
+               "per_page": ("per_page_size", 10, 100)},
+    "endpoint_security": {"method": "GET", "path": "/teams/{team_id}/logs/antiviruses", "team": "path",
+                          "per_page": ("per_page_size", 10, 100)},
+    "one_to_many": {"method": "GET", "path": "/teams/{team_id}/logs/one_to_many/computer_based",
+                    "team": "path", "per_page": ("per_page_size", 10, 100)},
+    "windows_updates": {"method": "GET", "path": "/teams/{team_id}/logs/windows_updates", "team": "path",
+                        "per_page": ("per_page_size", 10, 100)},
+}
+LogType = Literal[tuple(LOGS)]  # type: ignore[valid-type]
+SESSION_FIELDS = ("id,created_at,duration,status,service_kind,src_user_email,src_name,client_ip_addr,"
+                  "srs_name,srs_uuid,srs_owner_name,server_ip_addr,network_type,note,has_file_list,"
+                  "has_command_list,has_chat_list,has_recording_files")
 
 
 @mcp.tool(annotations=READ)
 async def splashtop_list_logs(
-    log_type: Annotated[str, Field(description="Log path under /teams/{team_id}/logs/, e.g. session, "
-                                               "file_transfer, history, windows_updates, alerts, "
-                                               "endpoint_security. splashtop_list_api_endpoints('log') "
-                                               "lists the documented ones")] = "session",
-    since_hours: Annotated[float | None, Field(gt=0, description="Keep only entries from the last N hours "
-                                                                 "(applied to the returned page)")] = None,
-    search: Annotated[str | None, Field(description="Case-insensitive text match on any field of an entry")] = None,
-    page: Page = None,
-    per_page: PerPage = None,
+    log_type: Annotated[LogType, Field(
+        description="sessions (remote sessions; finished and active), active_sessions, history (team joins/"
+                    "quits, failed logins), file_transfer, chat_transcript, service_desk, alerts (Endpoint "
+                    "Management alerts), endpoint_security (antivirus), one_to_many (1-to-many actions), "
+                    "windows_updates")] = "sessions",
+    since_hours: Annotated[float | None, Field(gt=0, le=2160, description="Entries from the last N hours "
+                                                                          "(max 90 days; default 7 days)")] = None,
+    start_time: Annotated[str | None, Field(description="UTC start, YYYY-MM-DD HH:MM:SS or ISO (at most 1 year ago)")] = None,
+    end_time: Annotated[str | None, Field(description="UTC end; at most 90 days after start_time")] = None,
+    keyword: Annotated[str | None, Field(description="sessions: Splashtop account or computer name; "
+                                                     "file_transfer: user email")] = None,
+    service_kinds: Annotated[list[str] | None, Field(
+        description="sessions only: unattended_remote, unattended_file, unattended_chat, unattended_cmpt, "
+                    "attended_remote (SOS), unattended_premium_tool, unattended_ssh, unattended_sftp, "
+                    "service_desk_premium_tool. Default unattended_remote + attended_remote")] = None,
+    computer_uuid: Annotated[str | None, Field(description="sessions only: only sessions to this computer (uuid)")] = None,
+    page: Annotated[int, Field(ge=1)] = 1,
+    per_page: Annotated[int | None, Field(ge=1, le=500, description="Page size (sessions/history/file transfer "
+                                                                    "50-500, others 10-100)")] = None,
     params: Params = None,
 ) -> dict[str, Any]:
-    """Get Splashtop logs: remote sessions (who connected to which computer, when, how long,
-    from where), file transfers, configuration history or Endpoint Management (Windows updates,
-    endpoint security, alerts). Needs the logs scope. Tries GET and falls back to POST for log
-    types that are queried with a body."""
-    log_type = log_type.strip().strip("/")
-    if not re.fullmatch(r"[A-Za-z0-9_\-/]+", log_type):
-        raise SplashtopError(f"Invalid log_type {log_type!r}")
-    path = f"/teams/{{team_id}}/logs/{log_type}"
-    query = _page_params(page, per_page, params)
+    """Get Splashtop logs: remote sessions (who connected to which computer, when, how long, from
+    which IP), team history (joins, failed logins), file transfers, chat transcripts, service desk
+    operations, and Endpoint Management alerts, antivirus, 1-to-many actions and Windows updates.
+    Needs the logs scope. Extra filters per type (alert_code, alert_log_status, action_kind,
+    result, status, group_id, kinds, session_ids, ...) go in `params`."""
+    spec = LOGS[log_type]
     c = get_client()
-    try:
-        result = await c.list(path, params=query)
-    except SplashtopError as e:
-        if e.status_code != 405:
-            raise
-        result = await c.list(path, method="POST", json_body=query)
-    items = result["items"]
+    size_key, lo, hi = spec["per_page"]
+    q: dict[str, Any] = {"page": page}
+    if per_page is not None:
+        q[size_key] = min(max(per_page, lo), hi)
     if since_hours:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
-        kept = []
-        for it in items:
-            when = _parse_time(_first(it, TIME_KEYS)[1]) if isinstance(it, dict) else None
-            if when is None or when >= cutoff:
-                kept.append(it)
-        items = kept
-    if search:
-        needle = search.lower()
-        items = [it for it in items if needle in str(it).lower()]
-    result["items"] = items
-    result["count"] = len(items)
-    result["log_type"] = log_type
+        start_time = start_time or _iso_utc(datetime.now(timezone.utc) - timedelta(hours=since_hours))
+    q["start_time"] = _st_time(start_time)
+    q["end_time"] = _st_time(end_time) if end_time else (
+        _st_time(_iso_utc(datetime.now(timezone.utc))) if start_time else None)
+    if keyword:
+        q["keyword"] = keyword
+    if log_type in ("sessions", "active_sessions"):
+        q["service_kinds"] = _csv(service_kinds) or "unattended_remote,attended_remote"
+        q["fields"] = SESSION_FIELDS
+        if computer_uuid:
+            q["srs_uuid"] = computer_uuid
+    if spec["team"] in ("body", "query"):
+        tid = await c.team_id()
+        q["team_id"] = int(tid) if tid.isdigit() else tid
+    q.update(params or {})
+    q = {k: v for k, v in q.items() if v is not None}
+    if spec["method"] == "POST":
+        payload = await c.post(spec["path"], {k: str(v) if k in ("page", size_key) else v for k, v in q.items()})
+    else:
+        payload = await c.get(spec["path"], q)
+    items = extract_items(payload)
+    result: dict[str, Any] = {"log_type": log_type, "count": len(items), "items": items}
+    info = {k: v for k, v in (unwrap(payload) if isinstance(unwrap(payload), dict) else {}).items()
+            if not isinstance(v, (list, dict))}
+    if info:
+        result["page_info"] = info
     return result
+
+
+def _iso_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+@mcp.tool(annotations=READ)
+async def splashtop_get_session_details(
+    session_id: Annotated[str, Field(description="Session id from splashtop_list_logs(log_type='sessions')")],
+    kinds: Annotated[list[Literal["file_list", "command_list", "chat_list", "voice_call_list",
+                                  "premium_tool_list", "recording_files"]],
+                     Field(min_length=1)] = ["file_list", "command_list", "chat_list"],  # noqa: B006
+) -> Any:
+    """Get what happened inside a remote session: files transferred, remote commands run, chat,
+    voice calls, background actions and recordings."""
+    return unwrap(await get_client().get(f"/teams/logs/closed_sessions/{session_id}",
+                                         {"kinds": _csv(kinds)}))
+
+
+@mcp.tool(annotations=READ)
+async def splashtop_list_tags() -> dict[str, Any]:
+    """List the computer tags (labels) defined in the team."""
+    return await get_client().list("/teams/{team_id}/labels")
+
+
+@mcp.tool(annotations=READ)
+async def splashtop_list_vulnerabilities(
+    keyword: Annotated[str | None, Field(description="CVE id or OS version, e.g. 'CVE-2025'")] = None,
+    cvss_levels: Annotated[list[Literal["low", "medium", "high", "critical"]] | None,
+                           Field(description="Only these CVSS levels")] = None,
+    in_cisa_kev: Annotated[bool | None, Field(description="Only CVEs in CISA's Known Exploited list")] = None,
+    remediation_statuses: Annotated[list[str] | None,
+                                    Field(description="e.g. overdue, control_applied")] = None,
+    order_by: Annotated[str, Field(description="risk_level, cvss, computers_count, published_date, ...")] = "risk_level",
+    page: Annotated[int, Field(ge=1)] = 1,
+    page_size: Annotated[int, Field(ge=20, le=500)] = 50,
+    params: Params = None,
+) -> dict[str, Any]:
+    """List the team's vulnerabilities (CVEs found on managed computers) with CVSS, CISA KEV flag,
+    affected computer count, remediation status and deadline (Splashtop AEM / Endpoint
+    Management). Team owner or super admin only."""
+    q: dict[str, Any] = {"keyword": keyword, "cvss_levels": _csv(cvss_levels), "in_cisa_kev": in_cisa_kev,
+                         "remediation_statuses": _csv(remediation_statuses), "order_by": order_by,
+                         "order": "desc", "page": page, "page_size": page_size, **(params or {})}
+    return await get_client().list("/teams/{team_id}/vulnerabilities", params=q)
 
 
 # ----------------------------------------------------------------- API docs / escape hatch

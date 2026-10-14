@@ -9,26 +9,30 @@ from splashtop_mcp.client import (SplashtopClient, SplashtopError, extract_items
                                   unwrap)
 
 
-def iso(days_ago: float) -> str:
+def st_time(days_ago: float) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-COMPUTERS = [
-    {"id": 1, "name": "FRONTDESK-PC", "os": "Windows 11", "online": True, "group_name": "Acme",
-     "last_online": iso(0)},
-    {"id": 2, "name": "ACCT-LAPTOP", "os": "Windows 10", "online": False, "group_name": "Acme",
-     "last_online": iso(45)},
-    {"id": 3, "name": "mac-mini", "os": "macOS", "online": False, "group_name": "Beta",
-     "last_online": iso(2)},
-]
-for i in range(4, 8):
-    COMPUTERS.append({"id": i, "name": f"WS-{i}", "os": "Windows 11", "online": True,
-                      "group_name": "Beta", "last_online": iso(0)})
+def ok(data, result=20200):
+    return httpx.Response(200, json={"result": result, "commands": {}, "messages": [], "data": data})
 
-SESSIONS = [
-    {"user": "tech@msp.com", "computer": "FRONTDESK-PC", "start_time": iso(0.01), "duration": 600},
-    {"user": "tech@msp.com", "computer": "ACCT-LAPTOP", "start_time": iso(10), "duration": 60},
+
+OVERVIEW = [
+    {"id": 1, "name": "FRONTDESK-PC", "uuid": "u1", "host_name": "frontdesk", "online_status": 1,
+     "last_online": st_time(0)},
+    {"id": 2, "name": "ACCT-LAPTOP", "uuid": "u2", "host_name": "acct", "online_status": 0,
+     "last_online": st_time(45)},
+    {"id": 3, "name": "mac-mini", "uuid": "u3", "host_name": "mac", "online_status": 0,
+     "last_online": st_time(2)},
 ]
+DETAILS = {
+    1: {"id": 1, "os": "Windows 11", "group_id": 10, "version": "3.7.2"},
+    2: {"id": 2, "os": "Windows 10", "group_id": 10, "version": "3.6.0"},
+    3: {"id": 3, "os": "macOS 15", "group_id": 20, "version": "3.7.2"},
+}
+GROUPS = [{"id": 10, "name": "Acme"}, {"id": 20, "name": "Beta"}]
+USERS = [{"id": 7, "email": "pat@msp.com", "role": "owner", "status": "enabled"},
+         {"id": 8, "email": "sam@client.com", "role": "member", "status": "enabled"}]
 
 
 class FakeSplashtop:
@@ -36,12 +40,15 @@ class FakeSplashtop:
         self.requests: list[httpx.Request] = []
         self.basic_info_calls = 0
         self.rate_limit_once = False
+        self.bad_token = False
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         if request.url.host == "docs.splashtop.com":
             return self.docs(request)
         assert request.headers["authorization"] == "Bearer tok"
+        if self.bad_token:
+            return ok({"error": "token_auth_fail"}, result=41406)
         if self.rate_limit_once:
             self.rate_limit_once = False
             return httpx.Response(429, headers={"retry-after": "0"})
@@ -49,51 +56,73 @@ class FakeSplashtop:
         assert path.startswith("/api/open/v1/")
         rest = path[len("/api/open/v1"):]
         q = request.url.params
+        body = json.loads(request.content) if request.content else None
         if rest == "/users/basic_info":
             self.basic_info_calls += 1
-            return httpx.Response(200, json={"result": 20200, "data": {
-                "email": "owner@msp.com", "team": {"stb_team_id": 4242, "name": "MSP"}}})
+            return ok({"email": "owner@msp.com", "scopes": {
+                "psa": {"team_id": 4242}, "logs": {"stb_team_id": 4242},
+                "team_computers": {"stb_team_id": 4242}}})
         if rest == "/teams/4242/computers":
-            items = COMPUTERS
-            if "group_id" in q:
-                items = [c for c in items if c["group_name"] == q["group_id"]]
-            page, per = int(q.get("page", 1)), int(q.get("per_page", 100))
-            chunk = items[(page - 1) * per: page * per]
-            return httpx.Response(200, json={"result": 20200, "data": {
-                "computers": chunk, "total": len(items), "page": page, "per_page": per}})
+            if "ids" in q:
+                assert q["customized_fields"]
+                return ok([DETAILS[int(i)] for i in q["ids"].split(",")])
+            items = OVERVIEW
+            if "online_status" in q:
+                items = [c for c in items if c["online_status"] == int(q["online_status"])]
+            return ok(items)
+        if rest == "/teams/4242/groups":
+            return ok(GROUPS)
+        if rest == "/teams/4242/groups/10/computers":
+            return ok([1, 2])
         if rest == "/teams/4242/users":
-            return httpx.Response(200, json={"result": 20200, "data": [
-                {"id": 7, "name": "Pat", "email": "pat@msp.com", "role": "admin"},
-                {"id": 8, "name": "Sam", "email": "sam@client.com", "role": "member"}]})
-        if rest == "/teams/4242/groups/9/members":
-            return httpx.Response(200, json={"data": {"members": [{"id": 7}]}})
-        if rest == "/teams/4242/logs/session":
-            if request.method == "GET":
-                return httpx.Response(405, json={"message": "Method not allowed"})
-            assert json.loads(request.content) == {"per_page": 50}
-            return httpx.Response(200, json={"result": 20200, "data": {"logs": SESSIONS}})
+            if "ids" in q:
+                return ok([u for u in USERS if str(u["id"]) in q["ids"].split(",")])
+            items = USERS
+            if "roles" in q:
+                items = [u for u in items if u["role"] in q["roles"].split(",")]
+            return ok(items)
+        if rest == "/teams/logs/closed_sessions" and request.method == "POST":
+            assert body["team_id"] == 4242 and body["service_kinds"]
+            assert body["start_time"] and body["page"] == "1"
+            items = [{"id": 333938, "srs_name": "FRONTDESK-PC", "src_user_email": "tech@msp.com"}]
+            return ok({"items": items, "total_pages": 1, "total_entries": 1})
+        if rest == "/teams/logs/closed_sessions/333938":
+            assert q["kinds"] == "file_list"
+            return ok({"file_list": [{"name": "a.txt", "action": "upload"}]})
+        if rest == "/teams/logs/histories":
+            assert q["team_id"] == "4242"
+            return ok({"logs": [{"kind": 159}], "total": 1})
         if rest == "/teams/4242/logs/windows_updates":
-            return httpx.Response(200, json={"result": 20200, "data": [{"kb": "KB5001"}]})
-        if rest == "/teams/4242/inventory":
-            if request.method == "POST":
-                assert json.loads(request.content) == {"computer_ids": ["1", "2"]}
-                return httpx.Response(200, json={"result": 20200, "data": {"1": {"cpu": "i5"}}})
+            assert q["per_page_size"] == "100"  # clamped to the 10-100 range
+            return ok({"page": 1, "total": 1, "order": "desc",
+                       "logs": [{"server_name": "FRONTDESK-PC", "code": "4577586", "state": "Not yet"}]})
+        if rest == "/teams/4242/inventory" and request.method == "POST":
+            assert body == {"ids": ["1", "2"], "fields": ["system", "hardware", "software"]}
+            return ok({"1": {"system": {"os": "Windows 11"}}})
+        if rest == "/teams/4242/labels":
+            return ok([{"id": 1, "name": "Servers"}])
+        if rest == "/teams/4242/vulnerabilities":
+            assert q["cvss_levels"] == "critical"
+            return ok({"team_cves": [{"cve_name": "CVE-2025-1"}],
+                       "pagination": {"current_page": 1, "total_pages": 1, "total_count": 1}},
+                      result="success")
         if rest == "/teams/4242/scope_denied":
-            return httpx.Response(200, json={"result": 40300, "message": "Permission denied"})
+            return httpx.Response(200, json={"result": 403, "data": {"error": "permission_denied"}})
         if rest == "/teams/4242/missing":
             return httpx.Response(404, json={"message": "Not found"})
+        if rest == "/teams/4242/paged":
+            page = int(q.get("page", 1))
+            return ok({"items": [{"i": page}], "total_pages": 3})
         if rest.startswith("/teams/4242/computers/") and request.method == "PUT":
-            return httpx.Response(200, json={"result": 20200})
+            return ok({})
         return httpx.Response(200, json={"path": rest, "params": dict(q)})
 
     @staticmethod
     def docs(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/llms.txt":
             return httpx.Response(200, text=(
-                "# Splashtop API\n\n## Computers\n"
-                "- [List Computers](https://docs.splashtop.com/reference/list-computers.md): Get computers\n"
-                "- [Add Notes to a Computer](https://docs.splashtop.com/reference/add-notes-to-a-computer-5-2-3.md)\n"
-                "## Logs\n"
+                "# Splashtop API\n\n## API Reference: Splashtop Open API V 2.1\n"
+                "- [Computer List](https://docs.splashtop.com/reference/computer-list-5-2-1.md): All computers\n"
                 "- [Windows Updates](https://docs.splashtop.com/reference/windows-updates-5-7-8.md): EM logs\n"))
         if request.url.path == "/reference/windows-updates-5-7-8.md":
             return httpx.Response(200, text="# Windows Updates\nGET /api/open/v1/teams/{team_id}/logs/windows_updates")
@@ -111,16 +140,16 @@ def fake(monkeypatch):
 def test_normalize_url():
     assert normalize_url(None) == "https://webapi.splashtop.com"
     assert normalize_url("eu") == "https://webapi.splashtop.eu"
+    assert normalize_url("OC") == "https://webapi.splashtop.nr"
     assert normalize_url("webapi.splashtop.eu/api/open/v1/") == "https://webapi.splashtop.eu"
-    assert normalize_url("https://gw.example.com:443") == "https://gw.example.com:443"
 
 
 def test_unwrap_and_extract():
-    assert unwrap({"result": 20200, "data": [1]}) == [1]
-    assert unwrap({"data": [1], "extra": 1}) == {"data": [1], "extra": 1}
-    assert extract_items({"result": 20200, "data": {"computers": [1, 2], "total": 2}}) == [1, 2]
-    assert extract_items([3]) == [3]
-    assert extract_items({"data": {"foo": [4], "total": 1}}) == [4]
+    env = {"result": 20200, "commands": {}, "messages": [], "data": [1]}
+    assert unwrap(env) == [1]
+    assert extract_items({"result": 20200, "data": {"items": [1, 2], "total_pages": 1}}) == [1, 2]
+    assert extract_items({"data": {"logs": [3], "total": 1, "page": 1}}) == [3]
+    assert extract_items([4]) == [4]
 
 
 def test_requires_token():
@@ -128,68 +157,79 @@ def test_requires_token():
         SplashtopClient("")
 
 
-async def test_account_info_detects_team(fake):
+async def test_account_info_detects_team_from_scopes(fake):
     info = await server.splashtop_get_account_info()
     assert info["team_id"] == "4242"
     assert info["basic_info"]["email"] == "owner@msp.com"
-    await server.splashtop_list_users()
-    assert fake.basic_info_calls == 2  # once for team id, once for the tool; then cached
 
 
-async def test_team_id_from_env_skips_lookup(monkeypatch):
-    fake = FakeSplashtop()
-    client = SplashtopClient("tok", team_id=4242, transport=httpx.MockTransport(fake))
-    monkeypatch.setattr(server, "_client", client)
-    await server.splashtop_list_users()
-    assert fake.basic_info_calls == 0
+async def test_bad_token_explains_token_type(fake):
+    fake.bad_token = True
+    with pytest.raises(SplashtopError, match="token_auth_fail.*Web API Tokens"):
+        await server.splashtop_get_account_info()
 
 
-async def test_list_computers_filters(fake):
+async def test_list_computers(fake):
     res = await server.splashtop_list_computers(name="laptop")
     assert [c["id"] for c in res["items"]] == [2]
-    assert res["page_info"]["total"] == 7
-    res = await server.splashtop_list_computers(group_id="Beta", per_page=2, page=2)
-    assert [c["id"] for c in res["items"]] == [5, 6]
-
-
-async def test_get_all_follows_pages(fake):
-    items = await server.get_client().get_all("/teams/{team_id}/computers", per_page=3)
-    assert [c["id"] for c in items] == list(range(1, 8))
+    res = await server.splashtop_list_computers(online=True)
+    assert [c["id"] for c in res["items"]] == [1]
+    res = await server.splashtop_list_computers(ids=[1, 3])
+    assert [c["os"] for c in res["items"]] == ["Windows 11", "macOS 15"]
 
 
 async def test_fleet_overview(fake):
     res = await server.splashtop_fleet_overview(offline_days=30)
-    assert res["total"] == 7
-    assert res["online"] == 5 and res["offline"] == 2
+    assert res["total"] == 3 and res["online"] == 1 and res["offline"] == 2
     assert [s["name"] for s in res["stale"]] == ["ACCT-LAPTOP"]
+    assert res["stale"][0]["group"] == "Acme" and res["stale"][0]["os"] == "Windows 10"
     assert [s["name"] for s in res["offline_recently_seen"]] == ["mac-mini"]
-    assert res["by_os"]["Windows 11"] == 5
-    assert res["by_group"] == {"Beta": 5, "Acme": 2}
-    assert res["detected_fields"] == {"online": "online", "last_seen": "last_online", "os": "os"}
+    assert res["by_group"] == {"Acme": 2, "Beta": 1}
+    assert res["by_streamer_version"]["3.7.2"] == 2
 
 
-async def test_logs_fall_back_to_post_and_filter(fake):
-    res = await server.splashtop_list_logs("session", since_hours=24, per_page=50)
-    assert res["count"] == 1
-    assert res["items"][0]["computer"] == "FRONTDESK-PC"
-    res = await server.splashtop_list_logs("windows_updates")
-    assert res["items"] == [{"kb": "KB5001"}]
-    with pytest.raises(SplashtopError):
-        await server.splashtop_list_logs("../users")
+async def test_get_all_follows_total_pages(fake):
+    items = await server.get_client().get_all("/teams/{team_id}/paged")
+    assert items == [{"i": 1}, {"i": 2}, {"i": 3}]
+    assert fake.requests[-1].url.params["per_page_size"] == "500"
 
 
-async def test_inventory(fake):
-    res = await server.splashtop_get_computer_inventory(["1", "2"])
-    assert res == {"1": {"cpu": "i5"}}
+async def test_users_and_groups(fake):
+    res = await server.splashtop_list_users(roles=["owner"])
+    assert [u["email"] for u in res["items"]] == ["pat@msp.com"]
+    res = await server.splashtop_list_groups(name="acme")
+    assert res["items"] == [{"id": 10, "name": "Acme"}]
+    assert fake.requests[-1].url.params["computers_count"] == "true"
+    res = await server.splashtop_list_group_members(10, kind="computers")
+    assert res["ids"] == [1, 2] and [c["os"] for c in res["items"]] == ["Windows 11", "Windows 10"]
 
 
-async def test_group_members(fake):
-    res = await server.splashtop_list_group_members("9")
-    assert res["items"] == [{"id": 7}]
+async def test_session_logs(fake):
+    res = await server.splashtop_list_logs("sessions", since_hours=24)
+    assert res["items"][0]["srs_name"] == "FRONTDESK-PC"
+    assert res["page_info"]["total_entries"] == 1
+    details = await server.splashtop_get_session_details("333938", kinds=["file_list"])
+    assert details["file_list"][0]["name"] == "a.txt"
+
+
+async def test_other_logs(fake):
+    res = await server.splashtop_list_logs("windows_updates", per_page=500)
+    assert res["items"][0]["code"] == "4577586"
+    res = await server.splashtop_list_logs("history", start_time="2026-10-01T00:00:00Z")
+    assert res["items"] == [{"kind": 159}]
+    sent = fake.requests[-1].url.params
+    assert sent["start_time"] == "2026-10-01 00:00:00" and sent["end_time"]
+
+
+async def test_inventory_tags_vulns(fake):
+    assert await server.splashtop_get_computer_inventory(["1", "2"]) == {"1": {"system": {"os": "Windows 11"}}}
+    assert (await server.splashtop_list_tags())["items"] == [{"id": 1, "name": "Servers"}]
+    vulns = await server.splashtop_list_vulnerabilities(cvss_levels=["critical"])
+    assert vulns["items"] == [{"cve_name": "CVE-2025-1"}]
 
 
 async def test_envelope_error_raises(fake):
-    with pytest.raises(SplashtopError, match="Permission denied"):
+    with pytest.raises(SplashtopError, match="permission_denied"):
         await server.get_client().get("/teams/{team_id}/scope_denied")
     with pytest.raises(SplashtopError, match="404") as e:
         await server.get_client().get("/teams/{team_id}/missing")
@@ -203,9 +243,8 @@ async def test_rate_limit_retry(fake):
 
 
 async def test_api_endpoints_and_docs(fake):
-    res = await server.splashtop_list_api_endpoints("log")
+    res = await server.splashtop_list_api_endpoints("update")
     assert [p["title"] for p in res["pages"]] == ["Windows Updates"]
-    assert res["pages"][0]["section"] == "Logs"
     doc = await server.splashtop_get_api_doc("windows-updates-5-7-8")
     assert "logs/windows_updates" in doc["content"]
     with pytest.raises(SplashtopError):
@@ -213,11 +252,13 @@ async def test_api_endpoints_and_docs(fake):
 
 
 async def test_api_request_get_and_write_gate(fake, monkeypatch):
-    res = await server.splashtop_api_request("/teams/{team_id}/computer_tags", params={"a": 1})
-    assert res == {"path": "/teams/4242/computer_tags", "params": {"a": "1"}}
-    # Read-only POST (log query) is allowed without writes.
-    res = await server.splashtop_api_request("/teams/{team_id}/logs/session", method="POST", body={"per_page": 50})
-    assert res["data"]["logs"]
+    res = await server.splashtop_api_request("/teams/{team_id}/something", params={"a": 1})
+    assert res == {"path": "/teams/4242/something", "params": {"a": "1"}}
+    # Read-only POST (session log query) is allowed without writes.
+    res = await server.splashtop_api_request("/teams/logs/closed_sessions", method="POST",
+                                             body={"team_id": 4242, "service_kinds": "unattended_remote",
+                                                   "start_time": "x", "page": "1"})
+    assert res["data"]["items"]
     with pytest.raises(SplashtopError, match="disabled"):
         await server.splashtop_api_request("/teams/{team_id}/computers/1", method="PUT", body={"name": "x"})
     monkeypatch.setattr(server, "WRITES_ENABLED", True)
@@ -226,10 +267,11 @@ async def test_api_request_get_and_write_gate(fake, monkeypatch):
     assert not any(r.method == "PUT" for r in fake.requests)
     done = await server.splashtop_api_request("/teams/{team_id}/computers/1", method="PUT",
                                               body={"name": "x"}, confirm=True)
-    assert done == {"result": 20200}
+    assert done["result"] == 20200
 
 
 def test_tools_registered():
     names = {t.name for t in server.mcp._tool_manager.list_tools()}
     assert {"splashtop_get_account_info", "splashtop_list_computers", "splashtop_fleet_overview",
-            "splashtop_list_logs", "splashtop_api_request"} <= names
+            "splashtop_list_logs", "splashtop_get_session_details", "splashtop_list_vulnerabilities",
+            "splashtop_api_request"} <= names

@@ -8,10 +8,13 @@
   inventory, ...) and can be restricted to read-only.
 * Most endpoints are team-scoped: ``/teams/{team_id}/...``. The team id is ``stb_team_id`` in
   ``GET /users/basic_info``; it is detected automatically unless SPLASHTOP_TEAM_ID is set.
-* Responses are JSON, often wrapped in an envelope such as ``{"result": 20200, "data": ...}``.
-  ``unwrap`` / ``extract_items`` peel that off so the tools work with either shape.
-* Rate limit: about 200 calls per minute per API. 429 responses are retried once after
-  ``Retry-After``.
+* Responses are wrapped as ``{"result": 20200, "commands": {}, "messages": [], "data": ...}``
+  (``result`` 200 / 20200 / "success" means OK; errors put the reason in ``data.error``).
+  ``unwrap`` / ``extract_items`` peel that off.
+* Paginated endpoints take ``page`` / ``per_page_size`` (or ``page_size``) and report
+  ``total_pages`` / ``total_entries`` / ``total`` / ``pagination``.
+* Rate limit: about 200 calls per minute per API (inventory: 10 per minute). 429 responses are
+  retried once after ``Retry-After``.
 """
 
 from __future__ import annotations
@@ -30,14 +33,16 @@ log = logging.getLogger(__name__)
 
 DEFAULT_URL = "https://webapi.splashtop.com"
 REGION_URLS = {"us": "https://webapi.splashtop.com", "global": "https://webapi.splashtop.com",
-               "eu": "https://webapi.splashtop.eu"}
+               "eu": "https://webapi.splashtop.eu", "oc": "https://webapi.splashtop.nr"}
 API_PREFIX = "/api/open/v1"
 MAX_PAGE = 500
 # Keys that hold the list in a collection response, most likely first.
-LIST_KEYS = ("items", "computers", "users", "groups", "members", "logs", "results", "records",
-             "list", "rows", "inventory", "tags")
-# Envelope status codes that mean success (HTTP-like, or Splashtop's 20xxx form).
-_OK_RESULT = re.compile(r"^(0|2\d\d|2\d{4})$")
+LIST_KEYS = ("items", "logs", "team_cves", "computers", "users", "groups", "members", "labels",
+             "tags", "results", "records", "list", "rows")
+# Envelope result values that mean success (HTTP-like, Splashtop's 20xxx form, or "success").
+_OK_RESULT = re.compile(r"^(0|2\d\d|2\d{4}|success|ok)$", re.I)
+# Auth failures returned as HTTP 200 with an error envelope.
+_AUTH_ERRORS = ("token_auth_fail", "invalid_token", "token_expired")
 
 
 class SplashtopError(ToolError):
@@ -67,8 +72,9 @@ def normalize_url(url: str | None) -> str:
 def unwrap(payload: Any) -> Any:
     """Return the useful part of a Splashtop response (``data`` of a result envelope)."""
     if isinstance(payload, dict) and "data" in payload and set(payload) <= {
-        "data", "result", "message", "msg", "code", "status", "success", "meta", "pagination",
-        "total", "page", "per_page", "total_pages", "next_page", "has_more", "count",
+        "data", "result", "commands", "messages", "message", "msg", "code", "status", "success",
+        "meta", "pagination", "total", "page", "per_page", "total_pages", "next_page", "has_more",
+        "count",
     }:
         return payload["data"]
     return payload
@@ -98,8 +104,9 @@ def page_info(payload: Any) -> dict[str, Any]:
         for block in (src, src.get("meta"), src.get("pagination"), src.get("page_info")):
             if not isinstance(block, dict):
                 continue
-            for key in ("total", "total_count", "totalCount", "page", "per_page", "page_size",
-                        "total_pages", "totalPages", "next_page", "has_more", "next"):
+            for key in ("total", "total_entries", "total_count", "totalCount", "page", "current_page",
+                        "per_page", "per_page_size", "page_size", "total_pages", "totalPages",
+                        "next_page", "has_more", "next"):
                 if key in block and key not in out and not isinstance(block[key], (list, dict)):
                     out[key] = block[key]
     return out
@@ -175,15 +182,26 @@ class SplashtopClient:
         if resp.is_success and not envelope_error:
             return body
         detail: Any = body
+        sub_error = ""
         if isinstance(body, dict):
-            detail = (body.get("message") or body.get("msg") or body.get("error_description")
-                      or body.get("error") or body.get("detail") or body)
+            data = body.get("data")
+            if isinstance(data, dict):
+                sub_error = str(data.get("error") or data.get("message") or "")
+            messages = body.get("messages")
+            msg_text = "; ".join(str(m) for m in messages) if isinstance(messages, list) else ""
+            detail = (sub_error or body.get("message") or body.get("msg") or msg_text
+                      or body.get("error_description") or body.get("error") or body.get("detail") or body)
             if isinstance(detail, dict):
                 detail = detail.get("message") or json.dumps(detail)
             if body.get("result") is not None:
                 detail = f"{detail} (result {body['result']})"
         hint = ""
-        if resp.status_code == 401:
+        if sub_error in _AUTH_ERRORS:
+            hint = (" (Splashtop rejected the token. It must be an Open API token from the web console: "
+                    "Account Settings > Web API Tokens, created by the team owner or a super admin. "
+                    "Third-party integration (PSA/RMM) API keys do not work with the Open API. "
+                    "EU teams also need SPLASHTOP_API_URL=eu)")
+        elif resp.status_code == 401:
             hint = (" (the API token is missing, invalid or expired; create a new one under "
                     "Account Settings > Web API Tokens)")
         elif resp.status_code == 403:
@@ -298,27 +316,24 @@ class SplashtopClient:
         path: str,
         *,
         params: dict[str, Any] | None = None,
+        page_param: str = "per_page_size",
         per_page: int = MAX_PAGE,
         max_items: int = 20000,
     ) -> list[Any]:
-        """All items of a collection. Follows ``page`` / ``per_page`` while the response shows
-        pagination; an unpaginated response is returned as is."""
-        items: list[Any] = []
+        """All items of a collection. The first request is sent as given; if the response shows
+        more pages, ``page`` / ``page_param`` are used to fetch the rest."""
+        payload = await self.get(path, params)
+        items = list(extract_items(payload))
+        info = page_info(payload)
         page = 1
-        seen_first: Any = object()
-        while True:
-            payload = await self.get(path, {**(params or {}), "page": page, "per_page": per_page})
-            batch = extract_items(payload)
-            info = page_info(payload)
-            # Servers that ignore "page" return the same first item every time: stop.
-            if not batch or (page > 1 and batch[0] == seen_first):
-                break
-            if page == 1:
-                seen_first = batch[0]
-            items.extend(batch)
-            if len(items) >= max_items or not _has_more(info, page, len(batch), per_page, len(items)):
-                break
+        while len(items) < max_items and _has_more(info, page, len(items)):
             page += 1
+            payload = await self.get(path, {**(params or {}), "page": page, page_param: per_page})
+            batch = extract_items(payload)
+            if not batch:
+                break
+            items.extend(batch)
+            info = page_info(payload)
         return items[:max_items]
 
     async def fetch_text(self, url: str) -> httpx.Response:
@@ -331,7 +346,7 @@ class SplashtopClient:
                 raise SplashtopError(f"Could not reach {url}: {e!r}") from e
 
 
-def _has_more(info: dict[str, Any], page: int, batch: int, per_page: int, so_far: int) -> bool:
+def _has_more(info: dict[str, Any], page: int, so_far: int) -> bool:
     if "has_more" in info:
         return bool(info["has_more"])
     if "next_page" in info or "next" in info:
@@ -339,30 +354,34 @@ def _has_more(info: dict[str, Any], page: int, batch: int, per_page: int, so_far
     pages = info.get("total_pages") or info.get("totalPages")
     if pages:
         return page < int(pages)
-    total = info.get("total") or info.get("total_count") or info.get("totalCount")
+    total = (info.get("total_entries") or info.get("total") or info.get("total_count")
+             or info.get("totalCount"))
     if total:
         return so_far < int(total)
-    if not info:
-        return False  # not paginated
-    return batch >= per_page
+    return False
+
+
+def _find_key(info: Any, key: str) -> Any:
+    if isinstance(info, dict):
+        if info.get(key) not in (None, ""):
+            return info[key]
+        values = info.values()
+    elif isinstance(info, list):
+        values = info
+    else:
+        return None
+    for value in values:
+        found = _find_key(value, key)
+        if found is not None:
+            return found
+    return None
 
 
 def _find_team_id(info: Any) -> Any:
-    """``stb_team_id`` (or ``team_id``) anywhere in the basic_info document."""
-    if isinstance(info, dict):
-        for key in ("stb_team_id", "team_id"):
-            if info.get(key) not in (None, ""):
-                return info[key]
-        for value in info.values():
-            found = _find_team_id(value)
-            if found is not None:
-                return found
-    elif isinstance(info, list):
-        for value in info:
-            found = _find_team_id(value)
-            if found is not None:
-                return found
-    return None
+    """``stb_team_id`` anywhere in the basic_info document (it sits under ``scopes.<scope>``),
+    falling back to ``team_id``."""
+    found = _find_key(info, "stb_team_id")
+    return found if found is not None else _find_key(info, "team_id")
 
 
 def host_of(url: str) -> str:
