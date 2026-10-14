@@ -43,8 +43,8 @@ calls it.
    **super admin**. The Open API is part of Splashtop Enterprise / Remote Support Premium plans.
 2. Go to **Account Settings → Web API Tokens** and create a token. **Use this kind of token only.** The
    "API key for third-party integration" (used by ConnectWise, Autotask and other PSA/RMM tools to start
-   sessions) is a different credential. The Open API rejects it with `token_auth_fail` (result 41406). Give it the scopes you need: `users`,
-   `logs`, `team_users`, `team_computers`, `team_groups`, `team_access_permission` and `inventory`.
+   sessions) is a different credential. The Open API rejects it with `token_auth_fail` (result 41406).
+   Give the token the scopes you need: `users`, `logs`, `team_users`, `team_computers`, `team_groups`, `team_access_permission` and `inventory`.
    Mark it **read-only** unless you plan to enable writes.
 3. Put it in `SPLASHTOP_API_TOKEN`. EU-hosted teams also set `SPLASHTOP_API_URL=eu`, and OC-hosted
    teams set `oc`.
