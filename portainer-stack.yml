@@ -1,0 +1,27 @@
+# Portainer stack for splashtop-mcp.
+# Stacks > Add stack > Web editor: paste this file, then fill in the variables under
+# "Environment variables" (or use "Load variables from .env file" with .env.example).
+services:
+  splashtop-mcp:
+    image: ghcr.io/riccanet/splashtop-mcp:latest
+    container_name: splashtop-mcp
+    restart: unless-stopped
+    environment:
+      SPLASHTOP_API_TOKEN: ${SPLASHTOP_API_TOKEN}
+      SPLASHTOP_API_URL: ${SPLASHTOP_API_URL:-us}
+      SPLASHTOP_TEAM_ID: ${SPLASHTOP_TEAM_ID:-}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN}
+      SPLASHTOP_ENABLE_WRITES: ${SPLASHTOP_ENABLE_WRITES:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${MCP_HOST_PORT:-8000}:8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,9 @@
+# Local build. For Portainer, see portainer-stack.yml.
+services:
+  splashtop-mcp:
+    build: .
+    image: splashtop-mcp:local
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
